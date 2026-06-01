@@ -1,0 +1,382 @@
+---
+title: "thesis10"
+author: "DINESH KUMAR DARSHNAM"
+date: "2026-05-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+required_pkgs <- c("MASS", "mclust", "dplyr")
+optional_pkgs <- c("PLNmodels")
+
+for(pkg in required_pkgs) {
+  if(!requireNamespace(pkg, quietly = TRUE)) {
+    stop("Please install package: ", pkg)
+  }
+}
+
+has_plnmodels <- requireNamespace("PLNmodels", quietly = TRUE)
+if(!has_plnmodels) {
+  warning("Package PLNmodels is not installed. PLN mixture fits will return NA.")
+}
+
+library(MASS)
+library(mclust)
+library(dplyr)
+
+set.seed(123)
+
+simulate_poisson_mix <- function(n, pi, lambda) {
+  G <- length(pi)
+  p <- ncol(lambda)
+
+  z <- sample(seq_len(G), size = n, replace = TRUE, prob = pi)
+  X <- matrix(0L, nrow = n, ncol = p)
+
+  for(i in seq_len(n)) {
+    X[i, ] <- rpois(p, lambda = lambda[z[i], ])
+  }
+
+  colnames(X) <- paste0("Y", seq_len(p))
+  list(X = X, z = z)
+}
+
+simulate_pln_mix <- function(n, pi, mu, Sigma) {
+  G <- length(pi)
+  p <- length(mu[[1L]])
+
+  z <- sample(seq_len(G), size = n, replace = TRUE, prob = pi)
+  X <- matrix(0L, nrow = n, ncol = p)
+
+  for(i in seq_len(n)) {
+    theta <- MASS::mvrnorm(n = 1L, mu = mu[[z[i]]], Sigma = Sigma[[z[i]]])
+    lambda <- exp(theta)
+    X[i, ] <- rpois(p, lambda = lambda)
+  }
+
+  colnames(X) <- paste0("Y", seq_len(p))
+  list(X = X, z = z)
+}
+
+anscombe <- function(X) {
+  2 * sqrt(X + 3/8)
+}
+
+fit_poisson_mixture_em <- function(X, G = 2, nstart = 10, maxit = 500, tol = 1e-8) {
+  X <- as.matrix(X)
+  n <- nrow(X)
+  p <- ncol(X)
+
+  best <- NULL
+  best_loglik <- -Inf
+
+  for(start in seq_len(nstart)) {
+    km <- tryCatch(
+      kmeans(anscombe(X), centers = G, nstart = 5),
+      error = function(e) NULL
+    )
+
+    if(is.null(km)) {
+      z_start <- sample(seq_len(G), n, replace = TRUE)
+    } else {
+      z_start <- km$cluster
+    }
+
+    pi_g <- as.numeric(table(factor(z_start, levels = seq_len(G)))) / n
+    pi_g[pi_g == 0] <- 1 / n
+    pi_g <- pi_g / sum(pi_g)
+
+    lambda <- matrix(NA_real_, nrow = G, ncol = p)
+    for(g in seq_len(G)) {
+      idx <- which(z_start == g)
+      if(length(idx) == 0) {
+        lambda[g, ] <- colMeans(X) + runif(p, 0.01, 0.1)
+      } else {
+        lambda[g, ] <- colMeans(X[idx, , drop = FALSE]) + 1e-6
+      }
+    }
+
+    old_loglik <- -Inf
+
+    for(iter in seq_len(maxit)) {
+      logdens <- matrix(0, nrow = n, ncol = G)
+
+      for(g in seq_len(G)) {
+        logdens[, g] <- log(pi_g[g]) + rowSums(
+          sapply(seq_len(p), function(j) dpois(X[, j], lambda = lambda[g, j], log = TRUE))
+        )
+      }
+
+      maxlog <- apply(logdens, 1, max)
+      dens_shifted <- exp(logdens - maxlog)
+      denom <- rowSums(dens_shifted)
+      tau <- dens_shifted / denom
+      loglik <- sum(maxlog + log(denom))
+
+      Nk <- colSums(tau)
+      pi_g <- Nk / n
+
+      for(g in seq_len(G)) {
+        if(Nk[g] <= 1e-12) {
+          lambda[g, ] <- colMeans(X) + 1e-6
+        } else {
+          lambda[g, ] <- colSums(tau[, g] * X) / Nk[g]
+          lambda[g, ] <- pmax(lambda[g, ], 1e-8)
+        }
+      }
+
+      if(abs(loglik - old_loglik) < tol) break
+      old_loglik <- loglik
+    }
+
+    if(loglik > best_loglik) {
+      best_loglik <- loglik
+      best <- list(
+        pi = pi_g,
+        lambda = lambda,
+        posterior = tau,
+        classification = max.col(tau),
+        loglik = loglik,
+        iter = iter
+      )
+    }
+  }
+
+  best
+}
+
+fit_poisson_mixture <- function(X, G = 2) {
+  tryCatch({
+    fit <- fit_poisson_mixture_em(X, G = G)
+    fit$classification
+  }, error = function(e) rep(NA_integer_, nrow(X)))
+}
+
+fit_anscombe_mclust <- function(X, G = 2) {
+  tryCatch({
+    fit <- mclust::Mclust(anscombe(as.matrix(X)), G = G)
+    fit$classification
+  }, error = function(e) rep(NA_integer_, nrow(X)))
+}
+
+fit_pln_mixture <- function(X, G = 2) {
+  if(!has_plnmodels) return(rep(NA_integer_, nrow(X)))
+
+  tryCatch({
+    count_df <- as.data.frame(X)
+
+    dat <- PLNmodels::prepare_data(
+      counts = count_df,
+      covariates = matrix(1, nrow = nrow(count_df), ncol = 1)
+    )
+
+    fit <- PLNmodels::PLNmixture(
+      Abundance ~ 1,
+      data = dat,
+      clusters = G
+    )
+
+    membership <- fit$models[[1]]$memberships
+
+    if(is.matrix(membership)) {
+      max.col(membership)
+    } else {
+      as.integer(membership)
+    }
+  }, error = function(e) rep(NA_integer_, nrow(X)))
+}
+
+safe_ari <- function(true_z, pred_z) {
+  if(length(pred_z) != length(true_z) || all(is.na(pred_z))) return(NA_real_)
+  mclust::adjustedRandIndex(true_z, pred_z)
+}
+
+evaluate_one_dataset <- function(X, z_true, G = 2, data_generating_model, n, rep) {
+  methods <- list(
+    "Poisson mixture EM" = fit_poisson_mixture,
+    "PLN mixture" = fit_pln_mixture,
+    "Anscombe + Mclust" = fit_anscombe_mclust
+  )
+
+  out <- lapply(names(methods), function(method_name) {
+    tm <- system.time({
+      pred <- methods[[method_name]](X, G = G)
+    })
+
+    data.frame(
+      data_generating_model = data_generating_model,
+      n = n,
+      rep = rep,
+      method = method_name,
+      ARI = safe_ari(z_true, pred),
+      runtime_seconds = as.numeric(tm["elapsed"]),
+      stringsAsFactors = FALSE
+    )
+  })
+
+  bind_rows(out)
+}
+
+G_true <- 2
+p_true <- 3
+pi_true <- c(0.4, 0.6)
+
+lambda_poisson <- rbind(
+  c(5, 2, 10),
+  c(1, 7, 3)
+)
+colnames(lambda_poisson) <- paste0("Y", seq_len(p_true))
+rownames(lambda_poisson) <- paste0("Cluster", seq_len(G_true))
+
+mu_pln <- list(
+  c(log(5), log(2), log(10)),
+  c(log(1), log(7), log(3))
+)
+
+Sigma_pln <- list(
+  matrix(
+    c(0.3, 0.1, 0.05,
+      0.1, 0.2, 0.05,
+      0.05, 0.05, 0.4),
+    nrow = 3,
+    byrow = TRUE
+  ),
+  matrix(
+    c(0.2, 0.05, 0.02,
+      0.05, 0.3, 0.01,
+      0.02, 0.01, 0.25),
+    nrow = 3,
+    byrow = TRUE
+  )
+)
+
+set.seed(123)
+study1_dataset <- simulate_poisson_mix(
+  n = 500,
+  pi = pi_true,
+  lambda = lambda_poisson
+)
+study1_df <- data.frame(
+  id = seq_len(nrow(study1_dataset$X)),
+  true_cluster = study1_dataset$z,
+  study1_dataset$X
+)
+write.csv(study1_df, "sim_study1_poisson_mixture.csv", row.names = FALSE)
+
+set.seed(123)
+study2_dataset <- simulate_pln_mix(
+  n = 500,
+  pi = pi_true,
+  mu = mu_pln,
+  Sigma = Sigma_pln
+)
+study2_df <- data.frame(
+  id = seq_len(nrow(study2_dataset$X)),
+  true_cluster = study2_dataset$z,
+  study2_dataset$X
+)
+write.csv(study2_df, "sim_study2_pln_mixture.csv", row.names = FALSE)
+
+cat("Datasets saved:\n")
+cat("1. sim_study1_poisson_mixture.csv: generated from independent Poisson mixture\n")
+cat("2. sim_study2_pln_mixture.csv: generated from Poisson-lognormal mixture\n\n")
+
+design <- expand.grid(
+  n = c(100, 250, 500),
+  rep = 1:20
+)
+
+all_results <- vector("list", 2 * nrow(design))
+k <- 1
+
+for(i in seq_len(nrow(design))) {
+  n_current <- design$n[i]
+  rep_current <- design$rep[i]
+
+  cat("Running Simulation Study 1:", i, "of", nrow(design), "\n")
+  set.seed(10000 + i)
+  sim1 <- simulate_poisson_mix(
+    n = n_current,
+    pi = pi_true,
+    lambda = lambda_poisson
+  )
+
+  all_results[[k]] <- evaluate_one_dataset(
+    X = sim1$X,
+    z_true = sim1$z,
+    G = G_true,
+    data_generating_model = "Independent Poisson mixture",
+    n = n_current,
+    rep = rep_current
+  )
+  k <- k + 1
+
+  cat("Running Simulation Study 2:", i, "of", nrow(design), "\n")
+  set.seed(20000 + i)
+  sim2 <- simulate_pln_mix(
+    n = n_current,
+    pi = pi_true,
+    mu = mu_pln,
+    Sigma = Sigma_pln
+  )
+
+  all_results[[k]] <- evaluate_one_dataset(
+    X = sim2$X,
+    z_true = sim2$z,
+    G = G_true,
+    data_generating_model = "Poisson-lognormal mixture",
+    n = n_current,
+    rep = rep_current
+  )
+  k <- k + 1
+}
+
+results_df <- bind_rows(all_results)
+
+summary_results <- results_df %>%
+  group_by(data_generating_model, n, method) %>%
+  summarise(
+    mean_ARI = mean(ARI, na.rm = TRUE),
+    sd_ARI = sd(ARI, na.rm = TRUE),
+    mean_runtime_seconds = mean(runtime_seconds, na.rm = TRUE),
+    sd_runtime_seconds = sd(runtime_seconds, na.rm = TRUE),
+    failures = sum(is.na(ARI)),
+    .groups = "drop"
+  )
+
+write.csv(results_df, "simulation_results_all.csv", row.names = FALSE)
+write.csv(summary_results, "simulation_summary_results.csv", row.names = FALSE)
+
+print(summary_results)
+
+if(requireNamespace("ggplot2", quietly = TRUE)) {
+  library(ggplot2)
+
+  p1 <- ggplot(results_df, aes(x = factor(n), y = ARI, fill = method)) +
+    geom_boxplot() +
+    facet_wrap(~ data_generating_model) +
+    labs(
+      x = "Sample size",
+      y = "Adjusted Rand Index",
+      title = "Clustering performance by data-generating model"
+    ) +
+    theme_minimal()
+
+  p2 <- ggplot(results_df, aes(x = factor(n), y = runtime_seconds, fill = method)) +
+    geom_boxplot() +
+    facet_wrap(~ data_generating_model) +
+    labs(
+      x = "Sample size",
+      y = "Runtime in seconds",
+      title = "Runtime by data-generating model"
+    ) +
+    theme_minimal()
+
+  print(p1)
+  print(p2)
+}
+```
